@@ -1,0 +1,9 @@
+streamlit
+pandas
+numpy
+pillow
+docling
+rapidocr-onnxruntime
+pytesseract
+openai
+python-dotenv
