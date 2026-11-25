@@ -40,20 +40,33 @@ def get_rapidocr_engine():
 
 
 def get_docling_converter():
-    """Singleton loader for IBM Docling DocumentConverter with hardware acceleration"""
+    """Singleton loader for IBM Docling DocumentConverter with version-safe hardware acceleration"""
     global _DOCLING_CONVERTER
     if _DOCLING_CONVERTER is None:
         from docling.document_converter import DocumentConverter, PdfFormatOption, ImageFormatOption
         from docling.datamodel.pipeline_options import PdfPipelineOptions
-        from docling.datamodel.base_models import InputFormat, AcceleratorOptions, AcceleratorDevice
+        from docling.datamodel.base_models import InputFormat
 
         pipeline_options = PdfPipelineOptions()
         pipeline_options.do_ocr = True
         pipeline_options.do_table_structure = False
-        pipeline_options.accelerator_options = AcceleratorOptions(
-            num_threads=4,
-            device=AcceleratorDevice.AUTO
-        )
+
+        # Version-safe import for AcceleratorOptions (moved in newer docling releases)
+        try:
+            from docling.datamodel.accelerator_options import AcceleratorOptions, AcceleratorDevice
+            pipeline_options.accelerator_options = AcceleratorOptions(
+                num_threads=4,
+                device=AcceleratorDevice.AUTO
+            )
+        except ImportError:
+            try:
+                from docling.datamodel.base_models import AcceleratorOptions, AcceleratorDevice
+                pipeline_options.accelerator_options = AcceleratorOptions(
+                    num_threads=4,
+                    device=AcceleratorDevice.AUTO
+                )
+            except ImportError:
+                pass  # Fall back to Docling's built-in default accelerator settings
 
         _DOCLING_CONVERTER = DocumentConverter(
             format_options={
@@ -248,18 +261,18 @@ def strip_section_prefix(text: str) -> str:
 
 
 def parse_bill_text(raw_text_or_lines):
-    """Parse normalized receipt text lines into structured item dictionaries"""
+    """Parse normalized receipt text lines into structured item dictionaries (including Sales Tax)"""
     items = []
     ignore_keywords = [
         "SUBTOTAL", "SUB-TOTAL", "SUB TOTAL", "TOTAL", "GRAND TOTAL",
-        "TAX", "SALES TAX", "BALANCE", "AMOUNT DUE", "BALANCE DUE",
+        "BALANCE", "AMOUNT DUE", "BALANCE DUE",
         "CHANGE", "CASH", "CREDIT", "DEBIT", "VISA", "MASTERCARD", "AMEX", "DISCOVER",
         "SAVINGS", "DISCOUNT", "COUPON", "MEMBER", "POINTS", "AMOUNT", "DUE",
         "ITEMS SOLD", "ITEM COUNT", "EFT", "APPROVED", "AUTH", "REF#", "AID",
         "TEND", "CARD", "ACCOUNT", "STORE", "THANK YOU", "CASHIER", "RECEIPT",
         "REGULAR PRICE", "YOU SAVED", "CLUB CARD", "REWARDS", "PRICE YOU PAY",
         "PURCHASE", "PAYMENT", "TIP", "GRATUITY", "DEBIT TEND", "VISA TEND",
-        "TARGET CIRCLE", "RED CARD", "REDCARD"
+        "TARGET CIRCLE", "RED CARD", "REDCARD", "TAXABLE", "TAX EXEMPT"
     ]
 
     raw_lines = raw_text_or_lines if isinstance(raw_text_or_lines, list) else raw_text_or_lines.splitlines()
@@ -334,10 +347,15 @@ def parse_bill_text(raw_text_or_lines):
             except ValueError:
                 continue
 
-            display_name = f"{cleaned_name.title()} (x{qty})" if qty > 1 else cleaned_name.title()
+            is_tax_line = bool(re.search(r"\b(SALES\s+TAX|STATE\s+TAX|LOCAL\s+TAX|TAX)\b", cleaned_name, re.IGNORECASE))
+            if is_tax_line:
+                qty = 1
+                display_name = "Sales Tax"
+            else:
+                display_name = f"{cleaned_name.title()} (x{qty})" if qty > 1 else cleaned_name.title()
 
             items.append({
-                "raw_name": cleaned_name,
+                "raw_name": "SALES TAX" if is_tax_line else cleaned_name,
                 "clean_name": display_name,
                 "qty": qty,
                 "price": round(price, 2),
@@ -453,11 +471,11 @@ def parse_receipt_with_total(file_bytes: bytes, filename: str):
             enhanced_pil.save(buf, format="JPEG", quality=88)
             base64_img = encode_image(buf.getvalue())
             prompt = """
-            Analyze this receipt image. Extract all purchased items AND the final printed receipt total.
+            Analyze this receipt image. Extract all purchased items (including Sales Tax as an item if present) AND the final printed receipt total.
             Return ONLY a valid JSON object with keys:
-            - "items": array of objects with keys ("raw_name", "clean_name", "qty", "price", "suggest_aa")
-            - "receipt_total": float number (the final Total / Amount Due printed at the bottom of the receipt, or null if not visible)
-            Exclude subtotal, tax, total, category headers, and savings lines from "items".
+- "items": array of objects with keys ("raw_name", "clean_name", "qty", "price", "suggest_aa")
+- "receipt_total": float number (the final Total / Amount Due printed at the bottom of the receipt, or null if not visible)
+            Exclude subtotal, total, category headers, and savings lines from "items".
             """
             response = client.chat.completions.create(
                 model="gpt-4o",
@@ -487,16 +505,38 @@ def parse_receipt_with_total(file_bytes: bytes, filename: str):
     elif not client and not is_pdf:
         warning_msg = f"Running local offline multi-engine extraction (receipt auto-segmented into {len(slices)} slice(s))."
 
-    # 2. PDF Invoices -> IBM Docling
+    # 2. PDF Invoices -> IBM Docling (with native PDF text layer backup)
     if is_pdf:
+        docling_err_msg = None
         try:
             docling_items, raw_lines = run_docling_on_slices(slices, file_ext=".pdf")
             printed_total = extract_receipt_total(raw_lines)
             cleaned_items = deduplicate_items(docling_items, receipt_total=printed_total)
             if cleaned_items:
                 return cleaned_items, "Local Document AI (IBM Docling)", warning_msg, printed_total
+            else:
+                docling_err_msg = f"Docling read {len(raw_lines)} lines, but 0 matched item price format."
         except Exception as docling_err:
+            docling_err_msg = str(docling_err)
             print(f"[Docling PDF Fallback] {docling_err}")
+
+        # Backup: Native PDF text layer via pypdfium2
+        try:
+            import pypdfium2 as pdfium
+            pdf = pdfium.PdfDocument(file_bytes)
+            pdf_lines = []
+            for page in pdf:
+                textpage = page.get_textpage()
+                pdf_lines.extend(textpage.get_text_range().splitlines())
+            printed_total = extract_receipt_total(pdf_lines)
+            pdf_items = deduplicate_items(parse_bill_text(pdf_lines), receipt_total=printed_total)
+            if pdf_items:
+                return pdf_items, "Local Document AI (IBM Docling + PDF Text Layer)", warning_msg, printed_total
+        except Exception as pdf_err:
+            print(f"[PDF Text Layer Fallback] {pdf_err}")
+
+        if docling_err_msg:
+            warning_msg = f"PDF Diagnostic: {docling_err_msg}"
 
     # 3. Receipt Images -> RapidOCR + Tesseract Fusion + IBM Docling Fallback
     if not is_pdf:
