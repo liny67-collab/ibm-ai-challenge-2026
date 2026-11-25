@@ -14,8 +14,8 @@ st.caption("Local PDF & Receipt Document AI · Multi-Engine Extraction · Real-T
 st.divider()
 
 # 2. Initialize Session State
-if "parsed_data" not in st.session_state:
-    st.session_state.parsed_data = None
+if "bill_df" not in st.session_state:
+    st.session_state.bill_df = None
 if "engine_used" not in st.session_state:
     st.session_state.engine_used = None
 if "warning_msg" not in st.session_state:
@@ -24,6 +24,26 @@ if "receipt_total" not in st.session_state:
     st.session_state.receipt_total = None
 if "editor_key" not in st.session_state:
     st.session_state.editor_key = 0
+
+
+def build_bill_dataframe(items: list, default_aa: bool) -> pd.DataFrame:
+    df = pd.DataFrame(items)
+    for col in ["clean_name", "qty", "price", "suggest_aa"]:
+        if col not in df.columns:
+            if col == "suggest_aa":
+                df[col] = default_aa
+            elif col == "price":
+                df[col] = 0.0
+            elif col == "qty":
+                df[col] = 1
+            else:
+                df[col] = ""
+    df["clean_name"] = df["clean_name"].fillna("").astype(str)
+    df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(1).astype(int)
+    df["price"] = pd.to_numeric(df["price"], errors="coerce").fillna(0.0).astype(float)
+    df["suggest_aa"] = df["suggest_aa"].fillna(default_aa).astype(bool)
+    return df[["clean_name", "qty", "price", "suggest_aa"]].reset_index(drop=True)
+
 
 # Sidebar: Global Settlement Parameters
 with st.sidebar:
@@ -34,7 +54,7 @@ with st.sidebar:
     
     st.divider()
     if st.button("🗑️ Clear Current Receipt", width="stretch"):
-        st.session_state.parsed_data = None
+        st.session_state.bill_df = None
         st.session_state.engine_used = None
         st.session_state.warning_msg = None
         st.session_state.receipt_total = None
@@ -61,12 +81,11 @@ with col1:
                 if st.button("🤖 Extract PDF Items with IBM Docling", type="primary", width="stretch"):
                     with st.spinner("Extracting structured line items via IBM Docling..."):
                         pdf_bytes = uploaded_file.getvalue()
-                        st.session_state.parsed_data = None
                         items, engine_used, warning_msg, receipt_total = parse_receipt_with_total(pdf_bytes, uploaded_file.name)
                         if items:
                             for item in items:
                                 item["suggest_aa"] = default_aa
-                            st.session_state.parsed_data = items
+                            st.session_state.bill_df = build_bill_dataframe(items, default_aa)
                             st.session_state.engine_used = engine_used
                             st.session_state.warning_msg = warning_msg
                             st.session_state.receipt_total = receipt_total
@@ -79,12 +98,11 @@ with col1:
                 if st.button("🚀 Parse Receipt Items", type="primary", width="stretch"):
                     with st.spinner("Extracting items, quantities, prices, and receipt total..."):
                         img_bytes = uploaded_file.getvalue()
-                        st.session_state.parsed_data = None
                         items, engine_used, warning_msg, receipt_total = parse_receipt_with_total(img_bytes, uploaded_file.name)
                         if items:
                             for item in items:
                                 item["suggest_aa"] = default_aa
-                            st.session_state.parsed_data = items
+                            st.session_state.bill_df = build_bill_dataframe(items, default_aa)
                             st.session_state.engine_used = engine_used
                             st.session_state.warning_msg = warning_msg
                             st.session_state.receipt_total = receipt_total
@@ -103,14 +121,13 @@ with col1:
         if st.button("🤖 Parse Text Receipt", type="primary", width="stretch"):
             if bill_input.strip():
                 with st.spinner("Parsing text line items..."):
-                    st.session_state.parsed_data = None
                     st.session_state.warning_msg = None
                     items = parse_bill_text(bill_input)
                     receipt_total = extract_receipt_total(bill_input)
                     if items:
                         for item in items:
                             item["suggest_aa"] = default_aa
-                        st.session_state.parsed_data = items
+                        st.session_state.bill_df = build_bill_dataframe(items, default_aa)
                         st.session_state.engine_used = "Local Rule & Regex Engine (Text Input)"
                         st.session_state.receipt_total = receipt_total
                         st.session_state.editor_key += 1
@@ -131,23 +148,9 @@ with col2:
     if st.session_state.get("warning_msg"):
         st.info(st.session_state.warning_msg)
 
-    if st.session_state.parsed_data and len(st.session_state.parsed_data) > 0:
-        df = pd.DataFrame(st.session_state.parsed_data)
-
-        for col in ["clean_name", "qty", "price", "suggest_aa"]:
-            if col not in df.columns:
-                if col == "suggest_aa":
-                    df[col] = default_aa
-                elif col == "price":
-                    df[col] = 0.0
-                elif col == "qty":
-                    df[col] = 1
-                else:
-                    df[col] = ""
-
-        display_cols = ["clean_name", "qty", "price", "suggest_aa"]
+    if st.session_state.bill_df is not None and len(st.session_state.bill_df) > 0:
         edited_df = st.data_editor(
-            df[display_cols],
+            st.session_state.bill_df,
             column_config={
                 "clean_name": st.column_config.TextColumn("Item Name", width="medium"),
                 "qty": st.column_config.NumberColumn("Qty", min_value=1, step=1, format="%d"),
@@ -168,7 +171,7 @@ with col2:
         clean_edited_df["clean_name"] = clean_edited_df["clean_name"].fillna("Unnamed Item").astype(str)
         clean_edited_df = clean_edited_df[
             ~((clean_edited_df["clean_name"].str.strip() == "") & (clean_edited_df["price"] == 0.0))
-        ]
+        ].reset_index(drop=True)
     else:
         clean_edited_df = None
         st.info("👈 Upload a PDF/image receipt or paste text on the left to verify line items and select AA splits.")
@@ -179,18 +182,17 @@ with col2:
     with st.expander("➕ Missing an Item or Sales Tax? Quick Add Here", expanded=False):
         printed_total_preview = st.session_state.get("receipt_total")
         if clean_edited_df is not None and printed_total_preview is not None:
-            cur_sum = round(float(clean_edited_df["price"].sum()), 2)
-            tax_gap = round(printed_total_preview - cur_sum, 2)
+            cur_checked_sum = round(float(clean_edited_df.loc[clean_edited_df["suggest_aa"], "price"].sum()), 2)
+            tax_gap = round(printed_total_preview - cur_checked_sum, 2)
             if tax_gap > 0.01:
                 if st.button(f"🧾 Auto-Add Difference as Sales Tax (+${tax_gap:.2f})", width="stretch"):
-                    current_list = clean_edited_df.to_dict("records")
-                    current_list.append({
+                    new_row = pd.DataFrame([{
                         "clean_name": "Sales Tax",
                         "qty": 1,
                         "price": tax_gap,
                         "suggest_aa": True,
-                    })
-                    st.session_state.parsed_data = current_list
+                    }])
+                    st.session_state.bill_df = pd.concat([clean_edited_df, new_row], ignore_index=True)
                     st.session_state.editor_key += 1
                     st.rerun()
 
@@ -207,15 +209,14 @@ with col2:
             if submitted:
                 if new_name.strip():
                     display_name = f"{new_name.strip().title()} (x{new_qty})" if new_qty > 1 else new_name.strip().title()
-                    new_item = {
+                    new_row = pd.DataFrame([{
                         "clean_name": display_name,
                         "qty": int(new_qty),
                         "price": round(float(new_price), 2),
                         "suggest_aa": auto_aa,
-                    }
-                    current_list = clean_edited_df.to_dict("records") if clean_edited_df is not None else []
-                    current_list.append(new_item)
-                    st.session_state.parsed_data = current_list
+                    }])
+                    base_df = clean_edited_df if clean_edited_df is not None else pd.DataFrame(columns=["clean_name", "qty", "price", "suggest_aa"])
+                    st.session_state.bill_df = pd.concat([base_df, new_row], ignore_index=True)
                     if not st.session_state.engine_used:
                         st.session_state.engine_used = "Manual Input"
                     st.session_state.editor_key += 1
@@ -227,8 +228,10 @@ with col2:
     # Real-Time Reconciliation & Dynamic Settlement
     # ==========================================
     if clean_edited_df is not None and len(clean_edited_df) > 0:
-        items_sum = round(float(clean_edited_df["price"].sum()), 2)
-        public_aa_sum = round(float(clean_edited_df.loc[clean_edited_df["suggest_aa"], "price"].sum()), 2)
+        checked_sum = round(float(clean_edited_df.loc[clean_edited_df["suggest_aa"], "price"].sum()), 2)
+        all_rows_sum = round(float(clean_edited_df["price"].sum()), 2)
+        items_sum = checked_sum
+        public_aa_sum = checked_sum
         per_person_share = round(public_aa_sum / max(int(num_roommates), 1), 2)
 
         calculate_split_bill(clean_edited_df, num_roommates=num_roommates, payer_name=payer_name)
@@ -249,17 +252,22 @@ with col2:
                 "Current Items Sum",
                 f"${items_sum:.2f}",
                 delta=f"Diff ${diff:+.2f}" if abs(diff) >= 0.01 else "Exact Match",
-                delta_color="off" if abs(diff) < 0.01 else "inverse"
+                delta_color="off" if abs(diff) < 0.01 else "inverse",
+                help="Live sum of currently checked items in the table above (updates immediately when checkboxes or prices change)"
             )
-            m_col3.metric("Shared AA Pool", f"${public_aa_sum:.2f}")
+            m_col3.metric(
+                "Shared AA Pool",
+                f"${public_aa_sum:.2f}",
+                help="Total amount to be split equally among roommates"
+            )
             m_col4.metric("Per Person (AA)", f"${per_person_share:.2f}")
 
             if abs(diff) < 0.01:
-                st.success("✅ **Reconciled:** The sum of all line items matches the receipt's printed total!")
+                st.success("✅ **Reconciled:** The sum of checked line items matches the receipt's printed total!")
             elif diff > 0:
-                st.warning(f"⚠️ **Reconciliation Notice:** Current items sum is **${diff:.2f}** less than the receipt total (likely Sales Tax or a missed item — use the quick-add panel above to fill the gap).")
+                st.warning(f"⚠️ **Reconciliation Notice:** Checked items sum is **${diff:.2f}** less than the receipt total (check remaining valid items, or use the quick-add panel above to add missing items/tax).")
             else:
-                st.warning(f"⚠️ **Reconciliation Notice:** Current items sum exceeds the receipt total by **${abs(diff):.2f}** (check for duplicate rows or unapplied discounts).")
+                st.warning(f"⚠️ **Reconciliation Notice:** Checked items sum exceeds the receipt total by **${abs(diff):.2f}** (uncheck duplicate/misread rows or adjust prices above).")
         else:
             m_col1, m_col2, m_col3 = st.columns(3)
             m_col1.metric("Current Items Sum", f"${items_sum:.2f}")
@@ -271,9 +279,9 @@ with col2:
         summary_lines = [
             f"🧾 SmartSplit Bill Summary (Paid by: {payer_name})",
             f"----------------------------------------",
-            f"• Total Receipt Amount: ${items_sum:.2f}",
-            f"• Shared AA Pool ({len(aa_items)} items): ${public_aa_sum:.2f}",
-            f"• Personal / Non-AA Items ({len(non_aa_items)} items): ${round(items_sum - public_aa_sum, 2):.2f}",
+            f"• All Parsed Rows Total: ${all_rows_sum:.2f}",
+            f"• Checked / Shared AA Pool ({len(aa_items)} items): ${public_aa_sum:.2f}",
+            f"• Unchecked / Excluded Rows ({len(non_aa_items)} items): ${round(all_rows_sum - public_aa_sum, 2):.2f}",
             f"• Split Among: {num_roommates} roommates",
             f"👉 Amount Each Roommate Owes {payer_name}: ${per_person_share:.2f}",
         ]
